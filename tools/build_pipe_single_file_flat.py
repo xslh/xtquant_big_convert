@@ -120,7 +120,7 @@ PIPE_TEMPLATE = PIPE_TEMPLATE.replace(
     BIGQMT_REDIS_CONFIG["redis_enabled"] = False
     # pipe 没有推送线：全推推送关掉（客户端轮询 get_full_tick / 执行回调由
     # 客户端轮询合成 #372）；下载队列和快照缓存需要 redis，一并关。
-    BIGQMT_REDIS_CONFIG["quote_push"] = {"enabled": False}
+    BIGQMT_REDIS_CONFIG["quote_push"] = {"enabled": True}
     BIGQMT_REDIS_CONFIG.setdefault("download_jobs_enabled", False)
     BIGQMT_REDIS_CONFIG.setdefault("full_tick_cache_enabled", False)
     print("[bigqmt_shell] pipe mode: transport=pipe background_threads=%s "
