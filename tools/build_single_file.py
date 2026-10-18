@@ -387,16 +387,18 @@ except Exception as account_config_error:
         _runtime.configure_runtime_account(account_id)
 
 try:
-    qmt_extra = {}
-    for function_name in (
-        "get_history_trade_detail_data", "get_value_by_order_id", "get_last_order_id",
-        "get_ipo_data", "get_new_purchase_limit", "get_assure_contract",
-        "get_enable_short_contract", "get_unclosed_compacts", "get_closed_compacts",
-        "get_debt_contract", "get_option_subject_position", "get_comb_option",
-        "get_hkt_exchange_rate",
-    ):
-        if function_name in globals():
-            qmt_extra[function_name] = globals()[function_name]
+    # Capture the QMT-injected globals from THIS namespace -- the one QMT exec'd
+    # the mounted file in, which is the only place those names exist. The
+    # embedded runtime module is exec'd into its own dict, so its own
+    # capture_qmt_injected_funcs(globals()) sees nothing. Never hand-copy the
+    # name list here: capture_qmt_injected_funcs owns it (_QMT_INJECTED_GLOBAL_FUNCS
+    # = trade entry points + downloads + formulas + query extras), and a copied
+    # subset silently drops whichever group was added last (that is how
+    # download_history_data went missing on a pipe-only deployment).
+    _capture = getattr(_runtime, "capture_qmt_injected_funcs", None)
+    qmt_extra = (_capture(globals()) if callable(_capture) else {}) or {}
+    if qmt_extra:
+        print("[bigqmt_shell] bound QMT-injected globals: %s" % sorted(qmt_extra))
     _runtime.bind_runtime_api(
         passorder_func=globals().get("passorder"),
         cancel_func=globals().get("cancel"),

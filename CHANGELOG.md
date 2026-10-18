@@ -6,6 +6,21 @@
 
 ### 修复
 
+- **flat 单文件构建漏绑 QMT 注入的下载/公式全局函数（pipe 部署分笔无法补下载）**：
+  `tools/build_single_file.py` / `tools/build_no_redis_single_file_flat.py` 的外壳 bootstrap 用一份
+  **手抄的 13 个函数名**去 `globals()` 里捞 QMT 注入的全局函数，名单里没有
+  `download_history_data` / `down_history_data` / `download_history_data2` 和公式族 5 个；而内嵌 runtime
+  模块里的 `capture_qmt_injected_funcs(globals())` 看到的是**独立 module dict**（flat loader 用
+  `exec(func.__code__, module.__dict__)`），永远为空。于是 `probe_capabilities.qmt_globals` 里下载三项恒为
+  `false`，`DownloadHistory` 只能报 `no download channel on this terminal`，pipe-only 部署的分笔无法补下载
+  （2026-10-18 在国金 QMT 2.1.19 实测：终端**确实**把 `download_history_data` / `down_history_data` 注入到挂载
+  文件命名空间，Boost.Python 函数、调用返回 True；`download_history_data2` 该版本未注入）。
+  外壳 bootstrap 改为 `_runtime.capture_qmt_injected_funcs(globals())`（官方名单单一来源，非 callable 自动跳过），
+  并在绑定时打印 `[bigqmt_shell] bound QMT-injected globals: [...]`。
+  验证：`probe_capabilities` 三项中 `download_history_data`/`down_history_data` 变 `true`；
+  `download_history_data("600000.SH","tick","20261015…")` 返回 True 且 `datadir/SH/0/600000/20261015.dat`
+  落地（715 KB）；端到端 `astock_tick` 补下 4966 条。
+
 - **pipe 部署的 RPC handlers 仍会拨 58610，QMT 弹 `非法IP:127.0.0.1:58610` 并冻结策略线程**：
   `_build_rpc_service` 为 handlers 单独构造了一个 `BigQmtMarketDataProvider`，没有像
   `adapter_factory.build_app` 那样按 `transport` 传入 `native_xtdata_enabled`，于是构造器默认的

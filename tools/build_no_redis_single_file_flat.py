@@ -586,6 +586,19 @@ try:
     _config = _load_local_config()
     BIGQMT_ACCOUNT_ID = getattr(_config, "BIGQMT_ACCOUNT_ID", "")
     print("[bigqmt_shell] local account config loaded=%s" % bool(BIGQMT_ACCOUNT_ID))
+    if str(BIGQMT_ACCOUNT_ID or "").strip() in ("", "YOUR_ACCOUNT_ID"):
+        # Fail loudly instead of listening on a pipe nobody dials. The RPC pipe
+        # is "<pipe_name>_<account_id>", so a bundle built from the template
+        # without filling in the config block serves ..._YOUR_ACCOUNT_ID while
+        # every client (and the Windows bridge) connects to ..._<real account>
+        # and dies with err=2 -- with nothing in either log saying why.
+        raise SystemExit(
+            "[bigqmt_shell] FATAL: BIGQMT_ACCOUNT_ID is %r -- the config block "
+            "at the top of this file was never filled in. The RPC pipe is named "
+            "'<pipe_name>_<account_id>', so this strategy would listen on "
+            "'..._YOUR_ACCOUNT_ID' while every client dials the real account's "
+            "pipe. Edit BIGQMT_ACCOUNT_ID in the config block and restart the "
+            "strategy." % (BIGQMT_ACCOUNT_ID,))
     _runtime.configure_runtime_account(BIGQMT_ACCOUNT_ID)
 except Exception as account_config_error:
     print("[bigqmt_shell] local account config load failed: %s" % account_config_error)
@@ -594,16 +607,18 @@ except Exception as account_config_error:
         _runtime.configure_runtime_account(account_id)
 
 try:
-    qmt_extra = {}
-    for function_name in (
-        "get_history_trade_detail_data", "get_value_by_order_id", "get_last_order_id",
-        "get_ipo_data", "get_new_purchase_limit", "get_assure_contract",
-        "get_enable_short_contract", "get_unclosed_compacts", "get_closed_compacts",
-        "get_debt_contract", "get_option_subject_position", "get_comb_option",
-        "get_hkt_exchange_rate",
-    ):
-        if function_name in globals():
-            qmt_extra[function_name] = globals()[function_name]
+    # Capture the QMT-injected globals from THIS namespace -- the one QMT exec'd
+    # the mounted file in, which is the only place those names exist. The
+    # embedded runtime module is exec'd into its own dict, so its own
+    # capture_qmt_injected_funcs(globals()) sees nothing. Never hand-copy the
+    # name list here: capture_qmt_injected_funcs owns it (_QMT_INJECTED_GLOBAL_FUNCS
+    # = trade entry points + downloads + formulas + query extras), and a copied
+    # subset silently drops whichever group was added last (that is how
+    # download_history_data went missing on a pipe-only deployment).
+    _capture = getattr(_runtime, "capture_qmt_injected_funcs", None)
+    qmt_extra = (_capture(globals()) if callable(_capture) else {}) or {}
+    if qmt_extra:
+        print("[bigqmt_shell] bound QMT-injected globals: %s" % sorted(qmt_extra))
     _runtime.bind_runtime_api(
         passorder_func=globals().get("passorder"),
         cancel_func=globals().get("cancel"),
@@ -624,6 +639,35 @@ deal_callback = _runtime.deal_callback
 # re-export it too or query_credit_account can never answer (#202).
 credit_account_callback = _runtime.credit_account_callback
 '''
+
+
+def _resolve_account_id(default="YOUR_ACCOUNT_ID"):
+    """Account id baked into the generated config block.
+
+    Never ship the placeholder: the RPC pipe is ``<pipe_name>_<account_id>``, so a
+    bundle left at ``YOUR_ACCOUNT_ID`` makes QMT serve ``..._YOUR_ACCOUNT_ID``
+    while every client (and the Windows bridge) dials ``..._<real account>`` and
+    fails with err=2 (2026-10-18). Resolution order: env ``BIGQMT_ACCOUNT_ID``,
+    then whatever ``load_client_config()`` finds on this machine (the same module
+    ``bigqmt-init`` writes), then the placeholder -- which the generated file now
+    refuses to start with.
+    """
+    account = os.environ.get("BIGQMT_ACCOUNT_ID", "").strip()
+    if account:
+        return account
+    try:
+        from bigqmt_signal_trader.xtquant_compat import load_client_config
+
+        config = load_client_config() or {}
+    except Exception:
+        return default
+    return str(config.get("account_id") or "").strip() or default
+
+
+FLAT_TEMPLATE = FLAT_TEMPLATE.replace(
+    'BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"',
+    "BIGQMT_ACCOUNT_ID = %r" % _resolve_account_id(),
+)
 
 
 if __name__ == "__main__":
