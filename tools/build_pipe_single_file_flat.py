@@ -9,9 +9,14 @@
 与 no-redis 版的差异：
 - 不替换 zmq_transport（pipe_transport 本来就在包里，ctypes/kernel32 零依赖）；
 - 不内嵌 bigqmt_no_redis/；
-- 强制 transport=pipe + redis_enabled=False + quote_push 关（pipe 没有推送线，
-  执行回调由客户端轮询合成，#372）+ download_jobs / full_tick_cache 关
-  （这两个需要 redis）。
+- 强制 transport=pipe + redis_enabled=False + download_jobs / full_tick_cache 关
+  （这两个需要 redis）；
+- 全推推送（quote_push）**默认开启**：pipe 自 #408 起有真正的推送线——专用的
+  events 命名管道（`pipe_events_path` 由 RPC 管道名派生出 `<pipe_name>_events_<acct>`，
+  服务端只写、客户端只读），tick 订阅走它；旧版本「pipe 没有推送线」的结论已经
+  过期，那时关掉 quote_push 会让 `subscribe_whole_quote` 直接回 "not configured"
+  （客户端的 `subscribe_quote(tick)` 随之失败）。需要轮询 `get_full_tick` 的部署
+  可在 BIGQMT_REDIS_CONFIG 里显式写 `"quote_push": {"enabled": False}` 关掉。
 
 用法：python tools/build_pipe_single_file_flat.py，产物在
 src/BIGQMT_DRYRUN_PIPE_FLAT_ALL_IN_ONE.py（或用 BIGQMT_BUILD_OUT 指定）。
@@ -118,13 +123,17 @@ PIPE_TEMPLATE = PIPE_TEMPLATE.replace(
     # Nothing here may dial out: redis 块不下发（懒 client 首个命令就 connect，
     # EDR 抓到就杀进程，2026-09-24 实盘）。
     BIGQMT_REDIS_CONFIG["redis_enabled"] = False
-    # pipe 没有推送线：全推推送关掉（客户端轮询 get_full_tick / 执行回调由
-    # 客户端轮询合成 #372）；下载队列和快照缓存需要 redis，一并关。
-    BIGQMT_REDIS_CONFIG["quote_push"] = {"enabled": False}
+    # pipe 自 #408 起有真正的推送线（专用 events 命名管道，服务端只写、客户端只读），
+    # 全推推送默认开；显式 quote_push.enabled=False
+    # 才关（关掉后 subscribe_whole_quote 会回 "not configured"，tick 订阅失败，
+    # 只能靠客户端 get_full_tick 轮询）。下载队列和快照缓存需要 redis，一并关。
+    BIGQMT_REDIS_CONFIG.setdefault("quote_push", {"enabled": True})
     BIGQMT_REDIS_CONFIG.setdefault("download_jobs_enabled", False)
     BIGQMT_REDIS_CONFIG.setdefault("full_tick_cache_enabled", False)
     print("[bigqmt_shell] pipe mode: transport=pipe background_threads=%s "
-          "redis_enabled=False quote_push=False" % BIGQMT_REDIS_CONFIG["rpc_background_threads"])''')
+          "redis_enabled=False quote_push=%s" % (
+              BIGQMT_REDIS_CONFIG["rpc_background_threads"],
+              dict(BIGQMT_REDIS_CONFIG.get("quote_push") or {}).get("enabled", True)))''')
 
 assert "transport=pipe" in PIPE_TEMPLATE and '"transport": "pipe",' in PIPE_TEMPLATE, \
     "template replacements did not land"
