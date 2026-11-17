@@ -138,7 +138,12 @@ class BigQmtAdaptersTest(unittest.TestCase):
         """issue #160 semantics: with no reachable quote service the native call
         raises, the dead-mark window caches the failure, and ContextInfo answers
         (the pre-#405 behavior, unchanged for machines without a co-running
-        miniQMT)."""
+        miniQMT).
+
+        The second call is answered from the metadata cache: contract details
+        are reference data, and re-asking the terminal for all 5000+ codes on
+        every download round is what queued the adjust thread into a timeout.
+        """
         context = FakeContext()
 
         def boom(code):
@@ -153,7 +158,8 @@ class BigQmtAdaptersTest(unittest.TestCase):
 
         self.assertEqual(first["InstrumentStatus"], 0)
         self.assertEqual(second["InstrumentStatus"], 0)
-        self.assertEqual(context.instrument_codes, ["000001.SZ", "000001.SZ"])
+        # one terminal read, one cached answer
+        self.assertEqual(context.instrument_codes, ["000001.SZ"])
         # window active: the dead native path must not be re-dialled
         self.assertTrue(
             provider._native_known_dead("get_instrument_detail")
@@ -170,6 +176,98 @@ class BigQmtAdaptersTest(unittest.TestCase):
 
         self.assertEqual(context.instrument_codes, ["000001.SZ"])
         self.assertEqual(data["InstrumentStatus"], 0)
+
+    # -- 合约元数据缓存 / 批量 ---------------------------------------------
+
+    def test_instrument_cache_can_be_disabled(self):
+        """instrument_cache_seconds=0 restores the read-every-time behavior."""
+        context = FakeContext()
+        provider = BigQmtMarketDataProvider(context)
+        provider.native_xtdata_enabled = False
+        provider.instrument_cache_seconds = 0
+
+        provider.get_instrument("sz000001")
+        provider.get_instrument("sz000001")
+
+        self.assertEqual(context.instrument_codes, ["000001.SZ", "000001.SZ"])
+
+    def test_instrument_cache_expires(self):
+        context = FakeContext()
+        provider = BigQmtMarketDataProvider(context)
+        provider.native_xtdata_enabled = False
+        provider.instrument_cache_seconds = 0.01
+
+        provider.get_instrument("sz000001")
+        time.sleep(0.02)
+        provider.get_instrument("sz000001")
+
+        self.assertEqual(context.instrument_codes, ["000001.SZ", "000001.SZ"])
+
+    def test_empty_instrument_is_not_cached(self):
+        """A miss must stay a miss: caching ``{}`` would hide a contract that
+        the terminal only starts answering once its 合约表 is refreshed."""
+        class SometimesEmpty(FakeContext):
+            def __init__(self):
+                super().__init__()
+                self.answers = [{}, {"InstrumentStatus": 0}]
+
+            def get_instrumentdetail(self, code):
+                self.instrument_codes.append(code)
+                return self.answers.pop(0)
+
+        context = SometimesEmpty()
+        provider = BigQmtMarketDataProvider(context)
+        provider.native_xtdata_enabled = False
+
+        self.assertEqual(provider.get_instrument("sz000001"), {})
+        self.assertEqual(provider.get_instrument("sz000001")["InstrumentStatus"], 0)
+
+    def test_get_instruments_batches_and_tolerates_single_failures(self):
+        """One bad code must not void the batch -- it answers ``{}`` alone."""
+        class FlakyContext(FakeContext):
+            def get_instrumentdetail(self, code):
+                self.instrument_codes.append(code)
+                if code == "000002.SZ":
+                    raise RuntimeError("合约表没拉全")
+                if code == "000003.SZ":
+                    return {}
+                return {"InstrumentStatus": 0, "InstrumentName": code}
+
+        context = FlakyContext()
+        provider = BigQmtMarketDataProvider(context)
+        provider.native_xtdata_enabled = False
+
+        data = provider.get_instruments(
+            ["sz000001", "sz000001", "sz000002", "sz000003", ""],
+            types=False,
+        )
+
+        # duplicates and blanks collapse, the rest answer individually
+        self.assertEqual(sorted(data), ["000001.SZ", "000002.SZ", "000003.SZ"])
+        self.assertEqual(data["000001.SZ"]["InstrumentName"], "000001.SZ")
+        self.assertEqual(data["000002.SZ"], {})   # failed item
+        self.assertEqual(data["000003.SZ"], {})   # terminal has no metadata
+        self.assertEqual(
+            context.instrument_codes, ["000001.SZ", "000002.SZ", "000003.SZ"]
+        )
+
+    def test_get_instruments_reuses_the_single_read_cache(self):
+        context = FakeContext()
+        provider = BigQmtMarketDataProvider(context)
+        provider.native_xtdata_enabled = False
+
+        one_by_one = provider.get_instrument("sz000001")
+        batched = provider.get_instruments(["sz000001"], types=False)
+
+        self.assertEqual(context.instrument_codes, ["000001.SZ"])
+        self.assertEqual(batched["000001.SZ"], one_by_one)
+
+    def test_get_instruments_rejects_a_bare_string(self):
+        provider = BigQmtMarketDataProvider(FakeContext())
+        provider.native_xtdata_enabled = False
+
+        with self.assertRaises(ValueError):
+            provider.get_instruments("sz000001")
 
     def test_get_ticks_keys_keep_the_caller_case_for_futures(self):
         """issue #58: futures instrument codes are lower-case ('rb2708.SF'), but

@@ -667,6 +667,16 @@ class BigQmtMarketDataProvider:
         # 那种终端上一次 SDK 调用就死。关掉后 _native() 恒 None，所有 native
         # 路径直接走既有回落。
         self.native_xtdata_enabled = bool(native_xtdata_enabled)
+        # 合约元数据缓存（code -> (payload, monotonic_ts)）。
+        #
+        # 这是**基准数据**：名称/上市日/每手股数/涨跌停基准在盘中不会变，
+        # 而全市场下载每轮都会把 5000+ 只重问一遍。缓存之前每一次都穿透到
+        # 终端，而 get_instrument 只能跑在 adjust 线程上一条一条处理（见
+        # redis_rpc 的 drain 模式）——队列一深就是整批 RPC 超时。
+        #
+        # 0 表示不缓存（保持旧行为，测试/排障可关）。
+        self.instrument_cache_seconds = 600.0
+        self._instrument_cache = {}
 
     def _context_method(self, method_name):
         method = getattr(self.context_info, method_name, None)
@@ -1209,6 +1219,9 @@ class BigQmtMarketDataProvider:
 
     def get_instrument(self, code):
         normalized = normalize_stock_code(code)
+        cached = self._instrument_cache_get(normalized)
+        if cached is not None:
+            return cached
         # Prefer the native SDK (miniQMT parity): the terminal-side ContextInfo
         # store can itself serve a poisoned contract table -- OpenDate=0 or
         # renamed-on dates that persist across terminal restarts (#405) --
@@ -1220,7 +1233,82 @@ class BigQmtMarketDataProvider:
             lambda: self.context_info.get_instrumentdetail(normalized),
             normalized,
         )
-        return data or {}
+        data = data or {}
+        # 空答案不缓存：它多半是「终端此刻没这只」的瞬时状态（下载中、
+        # 终端刚启动、过期合约表没拉全），缓存下来会让一次意外变成十分钟。
+        if data:
+            self._instrument_cache_put(normalized, data)
+        return data
+
+    def get_instruments(self, codes, types=True):
+        """批量合约元数据：一次 RPC 取 N 只，返回 ``{code: payload}``。
+
+        单只的 ``get_instrument`` 只能跑在 adjust 线程上逐条处理，全市场
+        5000+ 只就排成 5000+ 个请求——队列一深，后面每一条都撞自己的
+        超时（客户端看到的就是成片的 ``TimeoutError``）。批量把队列深度
+        从「合约数」压到「合约数 / 批大小」。
+
+        容错形状与 ``get_option_detail_data_batch`` 一致：任何一只失败都
+        只让它自己成为 ``{}``，绝不让整批作废——调用方按 code 取值，缺的
+        那只读出来就是空字典。
+
+        Parameters
+        ----------
+        codes : list[str]
+            合约代码；重复项与空项忽略。
+        types : bool, default True
+            是否一并附上 ``get_instrument_type`` 的结果（客户端用它区分
+            stock/etf/index，省掉一轮 RPC）。
+        """
+        if isinstance(codes, (str, bytes)) or not isinstance(codes, (list, tuple, set)):
+            raise ValueError("codes must be a list of stock codes")
+        result = {}
+        for value in codes:
+            raw = str(value or "").strip()
+            if not raw:
+                continue
+            normalized = normalize_stock_code(raw)
+            if normalized in result:
+                continue
+            try:
+                payload = dict(self.get_instrument(normalized) or {})
+            except Exception as exc:
+                log.warning("get_instruments: %s failed: %s", normalized, exc)
+                payload = {}
+            if types:
+                try:
+                    payload.setdefault("_type", self.get_instrument_type(normalized) or {})
+                except Exception:
+                    pass
+            # 键用「调用方给的写法」归一化后的代码，调用方按同一规则回查。
+            result[normalized] = payload
+        return result
+
+    # -- 合约元数据缓存 ----------------------------------------------------
+    def _instrument_cache_get(self, code):
+        if self.instrument_cache_seconds <= 0:
+            return None
+        entry = self._instrument_cache.get(code)
+        if entry is None:
+            return None
+        payload, ts = entry
+        if (time.monotonic() - ts) >= self.instrument_cache_seconds:
+            self._instrument_cache.pop(code, None)
+            return None
+        return payload
+
+    def _instrument_cache_put(self, code, payload):
+        if self.instrument_cache_seconds <= 0:
+            return
+        # 只在明显超限时整片清空：合约元数据是小 dict，全市场也就几 MB，
+        # 按 LRU 维护的复杂度不值得。
+        if len(self._instrument_cache) > 60000:
+            self._instrument_cache.clear()
+        self._instrument_cache[code] = (payload, time.monotonic())
+
+    def clear_instrument_cache(self):
+        """Drop the cached contract metadata (after a 除权/合约表 refresh)."""
+        self._instrument_cache.clear()
 
     def get_instrument_type(self, code, variety_list=None):
         if hasattr(self.context_info, "get_instrument_type"):

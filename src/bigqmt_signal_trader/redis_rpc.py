@@ -40,6 +40,7 @@ READ_METHODS = {
     "probe_order_identity",
     "get_ticks",
     "get_instrument",
+    "get_instruments",
     "get_instrument_type",
     "get_market_data",
     "get_market_data_ex",
@@ -274,6 +275,7 @@ SAFE_B64_DIGIT_ENCODE = str.maketrans("0123456789", "!#$%&()*~?")
 SAFE_B64_DIGIT_DECODE = str.maketrans("!#$%&()*~?", "0123456789")
 MARKET_DATA_METHODS = {
     "get_instrument_type",
+    "get_instruments",
     "get_market_data",
     "get_market_data_ex",
     "get_local_data",
@@ -420,6 +422,8 @@ HEAVY_READ_METHODS = frozenset([
     "get_option_detail_data_batch",
     "get_his_index_data",
     "get_longhubang",
+    # 合约元数据批量：一次请求就是 N 只，无论 N 多少都不该占 adjust 拍。
+    "get_instruments",
 ])
 
 # Reads that are heavy by SIZE: one code is milliseconds, a market token or a
@@ -431,6 +435,10 @@ HEAVY_READ_CODE_METHODS = frozenset([
     "get_market_data",
     "get_market_data_ex",
     "get_local_data",
+    # 单只合约详情：一次一个 code 时读终端本地合约表，本身是毫秒级，但它是
+    # 全市场下载里重复最频繁的调用。放到 heavy worker 上，adjust 拍不再被
+    # 一串 get_instrument 占用（列表形状走 get_instruments 的整批路径）。
+    "get_instrument",
 ])
 HEAVY_READ_CODES_THRESHOLD = 20
 
@@ -450,6 +458,22 @@ def _is_redis_timeout(exc):
     module = getattr(exc.__class__, "__module__", "")
     text = str(exc).lower()
     return ("redis" in module and "timeout" in name) or "timeout reading from socket" in text
+
+
+def _describe_exception(exc):
+    """``"<Type>: <message>"``, never empty even when ``str(exc)`` is.
+
+    ``TimeoutError()`` and a bare ``RuntimeError()`` stringify to ``""``, so
+    formatting the message alone produced ``"TimeoutError: "`` on the wire --
+    and every client that renders one line ("failed: %s") showed a failure
+    with no reason at all. The type is the load-bearing part; the message is
+    only appended when there is one.
+    """
+    kind = exc.__class__.__name__
+    message = str(exc).strip()
+    if not message:
+        return kind
+    return "%s: %s" % (kind, message)
 
 
 def to_jsonable(value):
@@ -4645,7 +4669,11 @@ class RedisPubSubRpcService:
                     self._remember_order_response(order_key, response, state="dispatched")
                 return response
         except Exception as exc:
-            response["error"] = "%s: %s" % (exc.__class__.__name__, exc)
+            # 异常类型必须始终出现在 error 里：客户端把「服务端回了一个错误」
+            # 和「回包根本没到」区分开，靠的就是这句话。有些 QMT 原生异常
+            # 的 str() 是空串（如 TimeoutError），只拼 message 会得到一个
+            # 空错误——调用方看到的就是一个没有原因的空失败。
+            response["error"] = _describe_exception(exc)
         response["_t_reply"] = time.time()
         if order_key is not None:
             self._remember_order_response(order_key, response, state="settled")

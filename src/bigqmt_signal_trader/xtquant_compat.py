@@ -1847,6 +1847,14 @@ DEFAULT_RPC_TIMEOUT_SECONDS = 30.0
 BATCH_TIMEOUT_FLOOR_SECONDS = 15.0
 BATCH_TIMEOUT_PER_ITEM_SECONDS = 0.5
 
+# How many contract details travel in one ``get_instruments`` round trip.
+#
+# The cost is paid twice -- once on the adjust thread (which is why a
+# 5000-code download used to queue itself into a timeout) and once on the wire
+# as a single JSON reply. 50 keeps a reply around 30KB while cutting the
+# request count for the whole A-share universe from 5000+ to ~105.
+DEFAULT_INSTRUMENT_BATCH_SIZE = 50
+
 
 class RpcServerRepliedError(RuntimeError):
     """The server answered with an error -- as opposed to a timeout/transport
@@ -2359,6 +2367,57 @@ class BigQmtXtData:
 
     def get_instrumentdetail(self, stock_code):
         return self.get_instrument_detail(stock_code)
+
+    def get_instruments(self, stock_list, types=True, batch_size=None,
+                        timeout_seconds=None):
+        """批量合约详情：``{code: payload}``，一次 RPC 取一整批。
+
+        miniQMT 的 ``xtdata.get_instrument_detail`` 只有单只入口，全市场
+        5000+ 只就退化成 5000+ 次往返；服务端这些调用在 adjust 线程上串行
+        处理，队列一深，后面每一条都会撞自己的超时（客户端表现为成片的
+        ``TimeoutError``）。这里按 ``batch_size`` 切片，每片一次 RPC。
+
+        Parameters
+        ----------
+        stock_list : list[str]
+            合约代码；重复项与空项忽略。
+        types : bool, default True
+            是否要服务端一并附上 ``get_instrument_type`` 的结果（键 ``_type``）。
+        batch_size : int | None
+            每片多少只。``None`` 用 :data:`DEFAULT_INSTRUMENT_BATCH_SIZE`。
+            切片不是性能问题而是**内存/回包大小**问题：一片 50 只的详情
+            ~30KB，一片 5000 只就是几 MB 的单个 JSON 回包。
+        timeout_seconds : float | None
+            单片的等待上限；``None`` 用客户端默认超时。
+
+        Returns
+        -------
+        dict[str, dict]
+            按归一化后的代码索引；服务端没答的代码**不会**出现在结果里，
+            已答但无元数据的代码给 ``{}``（与 ``get_instrument_detail`` 一致）。
+        """
+        size = DEFAULT_INSTRUMENT_BATCH_SIZE if batch_size is None else int(batch_size)
+        if size <= 0:
+            raise ValueError("batch_size must be positive")
+        wanted = []
+        seen = set()
+        for value in stock_list or []:
+            code = str(value or "").strip()
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            wanted.append(code)
+        result = {}
+        for start in range(0, len(wanted), size):
+            chunk = wanted[start:start + size]
+            data = self.client.call(
+                "get_instruments",
+                {"codes": chunk, "types": bool(types)},
+                timeout_seconds=timeout_seconds,
+            ) or {}
+            if isinstance(data, dict):
+                result.update(data)
+        return result
 
     def get_instrument_type(self, stock_code, variety_list=None):
         return self._call("get_instrument_type", code=stock_code, variety_list=variety_list)

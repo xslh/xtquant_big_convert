@@ -2,6 +2,33 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
+## [Unreleased]
+
+### 新增
+
+- **合约元数据批量接口 `get_instruments(codes)`**：大 QMT 的 `get_instrument_detail`
+  只有单只入口，而全市场下载会把它调用 5000+ 次。服务端在 drain 模式（`rpc_background_threads`
+  为 False）下把这些调用排在 QMT 策略线程上串行执行，队列越排越长，后面的请求逐个撞
+  自己的超时——客户端看到的就是成片的 `TimeoutError`（2026-11-17 实测：
+  `--data-type instrument --sector 沪深A股` 有 300+ 只拿不到元数据）。
+  - `BigQmtMarketDataProvider.get_instruments(codes, types=True)`：一次取一批，
+    任何一只失败只让它自己成为 `{}`，绝不作废整批。
+  - `BigQmtGrpcBridge.get_instruments()` / `BigQmtXtData.get_instruments()` 同名暴露；
+    客户端按 `DEFAULT_INSTRUMENT_BATCH_SIZE=50` 自动分批，可传 `batch_size=` 覆盖。
+  - 服务端把 `get_instruments` 放进 `HEAVY_READ_METHODS`（整批永不上 adjust 拍），
+    单只 `get_instrument` 进 `HEAVY_READ_CODE_METHODS`（长串单只读同样不再占拍）。
+
+### 修复
+
+- **合约元数据按 code 缓存（默认 600 秒）**：合约表是基准数据（名称/上市日/每手股数/
+  涨跌停基准盘中不变），此前每次调用都穿透到终端。增量下载每轮都会把全部合约重问
+  一遍，这一步现在几乎零成本。空答案**不缓存**——那多半是终端此刻还没这只，
+  缓存下来会把一次瞬时缺失放大成十分钟。`instrument_cache_seconds=0` 关闭缓存，
+  `clear_instrument_cache()` 手动失效。
+- **服务端错误不再丢掉异常类型**：`process_request` 原先用 `"%s: %s" % (类型名, str(exc))`，
+  而 `TimeoutError` 之类的 `str()` 是空串，客户端只收到一个没有原因的空失败。
+  现在统一走 `_describe_exception()`：消息为空时只给类型名，绝不给空串。
+
 ## [0.3.78] - 2026-10-27
 
 ### 修复
