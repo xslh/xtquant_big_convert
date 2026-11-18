@@ -122,7 +122,7 @@ class BigQmtStrategyRunnerTest(unittest.TestCase):
 
         strategy_module.adjust(FakeHistoryContext())
 
-        self.assertEqual(rpc_service.drained, [20])
+        self.assertEqual(rpc_service.drained, [200])
         self.assertEqual(self.app.ticks, [])
 
     def test_zmq_rpc_build_does_not_create_redis_clients(self):

@@ -3825,6 +3825,7 @@ class RedisPubSubRpcService:
         slow_request_seconds=1.0,
         heavy_offload=True,
         heavy_codes_threshold=HEAVY_READ_CODES_THRESHOLD,
+        heavy_queue_maxsize=200,
     ):
         self.listen_redis = redis_client
         # Heavy reads leave the adjust thread for one worker (#351). Only in
@@ -3832,7 +3833,11 @@ class RedisPubSubRpcService:
         # runs them off the strategy thread. See HEAVY_READ_METHODS.
         self.heavy_offload = bool(heavy_offload)
         self.heavy_codes_threshold = max(1, int(heavy_codes_threshold))
-        self._heavy_queue = queue.Queue()
+        # Bounded on purpose: an unbounded heavy queue hides a stall until the
+        # client's deadline expires. A full queue now answers RPC_BUSY, which
+        # the client retries briefly -- backpressure instead of silence.
+        self._heavy_queue_maxsize = max(1, int(heavy_queue_maxsize))
+        self._heavy_queue = queue.Queue(maxsize=self._heavy_queue_maxsize)
         # Replies the worker built. They are SENT from the adjust thread on
         # its next tick, never from the worker: a zmq ROUTER socket and a
         # named pipe handle are not shared between threads (the adjust thread
@@ -4024,6 +4029,12 @@ class RedisPubSubRpcService:
         return False
 
     def _heavy_by_size(self, canonical, params):
+        if canonical == "get_instrument":
+            # One code is milliseconds, but it is the MOST REPEATED call of a
+            # whole-market load. Leaving it on the adjust thread is what made
+            # 5000 of them queue themselves past every client deadline; on the
+            # heavy worker they never delay a tick.
+            return True
         params = params if isinstance(params, dict) else {}
         codes = params.get("stock_list")
         if codes is None:
@@ -4156,7 +4167,11 @@ class RedisPubSubRpcService:
             if self._heavy_count <= self.debug_log_limit:
                 print("%s heavy read -> worker method=%s queued=%s"
                       % (self.print_prefix, payload.get("method"), self._heavy_queue.qsize()))
-            self._heavy_queue.put(payload)
+            try:
+                self._heavy_queue.put_nowait(payload)
+            except queue.Full:
+                # Same contract as the deferred queue: refuse, never drop.
+                self._refuse_busy(payload, "heavy queue full (%d)" % self._heavy_queue.maxsize)
             return
         if self._should_process_in_listener(payload):
             self.process_request(payload)
@@ -4170,17 +4185,48 @@ class RedisPubSubRpcService:
         try:
             self.pending.put_nowait(payload)
         except queue.Full:
-            # A full pending queue (client polling storm) must not raise into the
-            # adjust thread — QMT stops the strategy on a callback raise. Drop the
-            # oldest request and keep the newest instead of crashing.
-            try:
-                self.pending.get_nowait()
-            except Exception:
-                pass
-            try:
-                self.pending.put_nowait(payload)
-            except Exception:
-                pass
+            # A full pending queue used to silently drop the OLDEST request and
+            # keep the newest. The caller then only ever saw its own deadline
+            # expire: "server busy" was indistinguishable from "bridge hung",
+            # so nobody could tell backpressure from a broken pipe (#357).
+            # Refuse explicitly instead -- the client maps RPC_BUSY to a short
+            # bounded retry, and a full queue must not raise into the adjust
+            # thread (QMT stops the strategy on a callback raise).
+            self._refuse_busy(payload, "pending queue full (%d)" % self.pending.maxsize)
+
+    def _refuse_busy(self, payload, reason):
+        """Answer ``RPC_BUSY`` for a request the server cannot queue.
+
+        Explicit refusal (instead of dropping the oldest entry) is what lets the
+        client retry the right request: the answer carries the same
+        ``request_id`` the caller is waiting on, so no reply is misrouted and no
+        request disappears without a trace.
+        """
+        request = dict(payload or {})
+        request_id = str(request.get("request_id") or request.get("id") or "")
+        self._busy_refused_count = getattr(self, "_busy_refused_count", 0) + 1
+        response = {
+            "schema_version": 1,
+            "request_id": request_id,
+            "account_id": str(request.get("account_id") or self.account_id or ""),
+            "method": str(request.get("method") or ""),
+            "ok": False,
+            "data": None,
+            "error": "RPC_BUSY: %s" % reason,
+            "server_error": "",
+            "handled_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "_t_recv": request.get("_received_at") or time.time(),
+            "_t_reply": time.time(),
+        }
+        if self._busy_refused_count <= 5 or self._busy_refused_count % 100 == 0:
+            print("%s refused busy request method=%s request_id=%s reason=%s (total %d)"
+                  % (self.print_prefix, response["method"], request_id, reason,
+                     self._busy_refused_count))
+        try:
+            self._publish_response(request, response)
+        except Exception:
+            pass
+        return response
 
     def _should_process_in_listener(self, payload):
         if not self.process_in_listener:
@@ -4395,7 +4441,7 @@ class RedisPubSubRpcService:
         """
         # Replies the heavy worker finished since last tick go out first:
         # they are already late by the read itself.
-        self.flush_heavy_replies()
+        self.flush_heavy_replies(max_items=500)
         # Settle carry-overs from earlier ticks before taking on new work.
         self.settle_pending_orders()
         processed = 0

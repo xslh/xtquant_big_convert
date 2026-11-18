@@ -1004,7 +1004,12 @@ def _drain_rpc_service(config):
     if _rpc_service is None:
         return 0
     rpc_config = dict(config.get("rpc") or {})
-    max_items = int(rpc_config.get("drain_max_items", 20))
+    # 200, not 20: contract metadata reads are sub-millisecond each once the
+    # terminal's 合约表 is warm, and a whole-market load arrives as a burst.
+    # ``drain_budget_seconds`` still caps the wall time per adjust tick, so a
+    # slow batch cannot stall the strategy loop -- 20 just meant the burst
+    # dribbled out over 100+ ticks and every request aged out of its deadline.
+    max_items = int(rpc_config.get("drain_max_items", 200))
     processed = 0
     if hasattr(_rpc_service, "drain_request_queue"):
         processed += _rpc_service.drain_request_queue(max_items=max_items)

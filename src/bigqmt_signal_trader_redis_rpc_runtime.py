@@ -404,7 +404,7 @@ def _apply_config(account_id):
         "response_channel_template": "bigqmt:rpc:resp:{account_id}:{request_id}",
         "response_key_template": "bigqmt:rpc:resp:{account_id}:{request_id}",
         "response_ttl_seconds": 60,
-        "drain_max_items": 20,
+        "drain_max_items": 200,
         "drain_budget_seconds": RPC_DRAIN_BUDGET_SECONDS,
         "heavy_offload": RPC_HEAVY_OFFLOAD,
         "heavy_codes_threshold": RPC_HEAVY_CODES_THRESHOLD,

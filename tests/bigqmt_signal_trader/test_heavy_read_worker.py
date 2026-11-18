@@ -117,8 +117,15 @@ class HeavyClassificationTest(unittest.TestCase):
             self.assertFalse(self.service.is_heavy_read(method, {"stock_list": ["SH"] * 100}), method)
 
     def test_cheap_methods_are_light(self):
-        for method in ("ping", "get_instrument_detail", "get_trading_dates", "get_stock_name"):
+        for method in ("ping", "get_trading_dates", "get_stock_name"):
             self.assertFalse(self.service.is_heavy_read(method, {}), method)
+
+    def test_single_contract_detail_is_heavy(self):
+        # One code is milliseconds, but it is the most repeated call of a
+        # whole-market load (5000+ of them). Left on the adjust thread they
+        # queued themselves past every client deadline.
+        self.assertTrue(self.service.is_heavy_read("get_instrument_detail", {}))
+        self.assertTrue(self.service.is_heavy_read("get_instrument", {"code": "600000.SH"}))
 
     def test_trade_context_and_orders_never_offload(self):
         big = {"stock_list": ["SH"] * 100, "period": "tick"}
