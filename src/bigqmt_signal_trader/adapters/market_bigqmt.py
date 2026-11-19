@@ -1316,7 +1316,7 @@ class BigQmtMarketDataProvider:
         normalized = normalize_stock_code(code)
         pure = normalized.split(".")[0]
         result = {
-            "stock": pure.startswith(("000", "001", "002", "003", "300", "301", "600", "601", "603", "605", "688", "689")),
+            "stock": pure.startswith(("000", "001", "002", "003", "300", "301","302", "600", "601", "603", "605", "688", "689")),
             "fund": pure.startswith(("15", "16", "50", "51", "56", "58")),
             "etf": pure.startswith(("15", "51", "56", "58")),
             "bond": pure.startswith(("11", "12")),
