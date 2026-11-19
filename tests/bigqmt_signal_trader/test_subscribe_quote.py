@@ -60,7 +60,9 @@ class FakeClient(object):
         self.full_tick_cache_config = {"bar_poll_interval_seconds": 0.02}
         self.transport_name = "redis"
         self.calls = []
-        self._bars = bars if bars is not None else [[{"time": 1, "close": 1.0}]]
+        self._bars = bars if bars is not None else [
+            [{"time": 1, "close": 1.0}, {"time": 2, "close": 1.1}]
+        ]
         self._index = 0
 
     def call(self, method, params=None, **kwargs):
@@ -152,9 +154,12 @@ class BarSubscriptionTest(unittest.TestCase):
         return False
 
     def test_a_new_bar_reaches_the_callback(self):
+        # Only the bar before the newest one is finished, so each poll result
+        # must carry the forming bar as well as the completed one.
         client = FakeClient(bars=[
-            [{"time": 1, "close": 1.0}],
             [{"time": 1, "close": 1.0}, {"time": 2, "close": 1.1}],
+            [{"time": 1, "close": 1.0}, {"time": 2, "close": 1.1},
+             {"time": 3, "close": 1.2}],
         ])
         data = _xtdata(client)
         seen = []
@@ -162,19 +167,56 @@ class BarSubscriptionTest(unittest.TestCase):
         seq = data.subscribe_quote("600000.SH", period="1m", callback=seen.append)
         try:
             self.assertTrue(self._wait(lambda: len(seen) >= 2),
-                            "second bar never delivered: %r" % (seen,))
+                            "second finished bar never delivered: %r" % (seen,))
         finally:
             data.unsubscribe_quote(seq)
 
-    def test_an_unchanged_bar_is_not_re_emitted(self):
-        client = FakeClient(bars=[[{"time": 1, "close": 1.0}]])
+    def test_an_unchanged_finished_bar_is_not_re_emitted(self):
+        client = FakeClient(bars=[
+            [{"time": 1, "close": 1.0}, {"time": 2, "close": 1.1}],
+        ])
         data = _xtdata(client)
         seen = []
 
         seq = data.subscribe_quote("600000.SH", period="1m", callback=seen.append)
         try:
             time.sleep(0.3)   # several poll intervals
-            self.assertEqual(len(seen), 1, "re-emitted an unchanged bar")
+            self.assertEqual(len(seen), 1, "re-emitted an unchanged finished bar")
+        finally:
+            data.unsubscribe_quote(seq)
+
+    def test_a_forming_bar_alone_is_never_emitted(self):
+        """One bar back means it is still forming: there is nothing to report."""
+        client = FakeClient(bars=[[{"time": 1, "close": 1.0}]])
+        data = _xtdata(client)
+        seen = []
+
+        seq = data.subscribe_quote("600000.SH", period="1m", callback=seen.append)
+        try:
+            time.sleep(0.3)
+            self.assertEqual(seen, [], "an in-progress bar must not be pushed")
+        finally:
+            data.unsubscribe_quote(seq)
+
+    def test_the_forming_bar_oscillating_does_not_refire(self):
+        """The RPC and FormulaServer paths disagree slightly on the live bar.
+
+        Re-reading the *forming* bar therefore looks like a change every poll
+        (measured: 59 pushes / 59 distinct OHLCVs in 3 minutes). Only finished
+        bars are compared, so the oscillation must stay silent.
+        """
+        client = FakeClient(bars=[
+            [{"time": 1, "close": 1.0}, {"time": 2, "close": 1.1, "volume": 100}],
+            [{"time": 1, "close": 1.0}, {"time": 2, "close": 1.1, "volume": 762609}],
+            [{"time": 1, "close": 1.0}, {"time": 2, "close": 1.1, "volume": 753313}],
+        ])
+        data = _xtdata(client)
+        seen = []
+
+        seq = data.subscribe_quote("600000.SH", period="1m", callback=seen.append)
+        try:
+            time.sleep(0.4)   # many poll intervals over the oscillating bar
+            self.assertEqual(len(seen), 1, "forming-bar jitter leaked through")
         finally:
             data.unsubscribe_quote(seq)
 
@@ -192,7 +234,9 @@ class BarSubscriptionTest(unittest.TestCase):
     def test_a_raising_callback_does_not_end_the_subscription(self):
         """A subscriber's bug must not silently unsubscribe them."""
         client = FakeClient(bars=[
-            [{"time": 1}], [{"time": 2}], [{"time": 3}],
+            [{"time": 1}, {"time": 2}],
+            [{"time": 1}, {"time": 2}, {"time": 3}],
+            [{"time": 1}, {"time": 2}, {"time": 3}, {"time": 4}],
         ])
         data = _xtdata(client)
         calls = []
@@ -216,7 +260,7 @@ class BarSubscriptionTest(unittest.TestCase):
                     raise RuntimeError("transport hiccup")
                 return FakeClient.call(self, method, params, **kwargs)
 
-        client = _Flaky(bars=[[{"time": 9, "close": 2.0}]])
+        client = _Flaky(bars=[[{"time": 9, "close": 2.0}, {"time": 10, "close": 2.1}]])
         data = _xtdata(client)
         seen = []
 
@@ -319,12 +363,13 @@ class NoDataDiagnosticTest(unittest.TestCase):
                                        callback=lambda d: None)
             try:
                 self.assertTrue(self._wait(lambda: any(
-                    "no 1m bars for 600000.SH" in message for message in caught.output)))
+                    "no finished 1m bars for 600000.SH" in message
+                    for message in caught.output)))
             finally:
                 data.unsubscribe_quote(seq)
 
         message = "".join(caught.output)
-        self.assertIn("no 1m bars", message)
+        self.assertIn("no finished 1m bars", message)
         self.assertIn("600000.SH", message)
 
     def test_it_is_reported_once_not_every_poll(self):
@@ -341,7 +386,7 @@ class NoDataDiagnosticTest(unittest.TestCase):
 
     def test_data_appearing_later_still_fires_the_callback(self):
         """The subscription must stay live through the quiet period."""
-        client = FakeClient(bars=[[], [], [{"time": 1, "close": 1.0}]])
+        client = FakeClient(bars=[[], [], [{"time": 1, "close": 1.0}, {"time": 2, "close": 1.1}]])
         data = _xtdata(client)
         seen = []
 
@@ -367,3 +412,81 @@ class NoDataDiagnosticTest(unittest.TestCase):
             poller.stop()
 
         self.assertEqual(reports, [])
+
+
+class BarSignatureTest(unittest.TestCase):
+    """A bar's signature must follow its *content*, not just its row identity.
+
+    Keying a pandas frame by ``(index[-1], len(df))`` looks sufficient until the
+    subscription asks for one bar: ``len`` is then always 1 and a daily bar's
+    index is its trading date, so the signature never changed during a session.
+    A 1d subscription fired once at subscribe time and never again (measured
+    2026-11-19: pushed ``close=7.62`` while a concurrent read returned
+    ``close=7.64``, with no further push for 8 minutes).
+    """
+
+    @staticmethod
+    def _frame(close, volume=100.0, day="20261119"):
+        import pandas as pd
+
+        return {"601288.SH": pd.DataFrame(
+            [{"time": 1795017600000, "open": 7.67, "high": 7.67, "low": 7.60,
+              "close": close, "volume": volume}],
+            index=[day],
+        )}
+
+    def test_a_moving_close_changes_the_signature(self):
+        first = compat._BarPoller._signature(self._frame(7.62))
+        later = compat._BarPoller._signature(self._frame(7.64))
+        self.assertNotEqual(first, later, "an in-progress bar update must fire")
+
+    def test_a_growing_volume_changes_the_signature(self):
+        first = compat._BarPoller._signature(self._frame(7.62, volume=487179))
+        later = compat._BarPoller._signature(self._frame(7.62, volume=566297))
+        self.assertNotEqual(first, later, "a volume-only update must fire")
+
+    def test_an_unchanged_bar_does_not_refire(self):
+        first = compat._BarPoller._signature(self._frame(7.62))
+        again = compat._BarPoller._signature(self._frame(7.62))
+        self.assertEqual(first, again, "an identical bar must not spam the caller")
+
+    def test_a_rollover_changes_the_signature(self):
+        today = compat._BarPoller._signature(self._frame(7.62, day="20261119"))
+        tomorrow = compat._BarPoller._signature(self._frame(7.62, day="20261120"))
+        self.assertNotEqual(today, tomorrow)
+
+    def test_the_signature_is_stable_across_numeric_scalar_reprs(self):
+        """``repr`` of a numpy scalar changed between numpy 1.x and 2.x."""
+        self.assertEqual(compat._stable_scalar(7.62), repr(float(7.62)))
+        self.assertEqual(compat._stable_scalar(None), None)
+        self.assertEqual(compat._stable_scalar("x"), "x")
+
+    def test_a_poller_fires_when_the_bar_moves(self):
+        frames = [self._frame(7.62), self._frame(7.64), self._frame(7.64)]
+        state = {"i": 0}
+
+        def fetch():
+            index = min(state["i"], len(frames) - 1)
+            state["i"] += 1
+            return frames[index]
+
+        seen = []
+        poller = compat._BarPoller(fetch, seen.append, 0.02)
+        poller.start()
+        try:
+            self.assertTrue(self._wait(lambda: len(seen) >= 2))
+            time.sleep(0.15)   # several more polls over an unchanged bar
+        finally:
+            poller.stop()
+
+        self.assertEqual(len(seen), 2,
+                         "the unchanged third poll must not fire (got %d)" % len(seen))
+
+    @staticmethod
+    def _wait(predicate, timeout=2.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return predicate()

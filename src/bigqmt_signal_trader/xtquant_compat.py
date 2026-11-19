@@ -2030,6 +2030,33 @@ def _notice_field_list_cost(field_list):
 # Interval is a floor on how stale a bar can be, not a promise of freshness.
 DEFAULT_BAR_POLL_INTERVAL_SECONDS = 3.0
 
+#: Columns that make a bar "changed" for the poller's signature.
+#:
+#: ``time`` is included because a rollover is a change even when the OHLCV of
+#: the new bar is identical to the old one. The prices and volume are what an
+#: in-progress bar actually moves during a session; without them a daily bar
+#: keeps the same signature all day (see ``_BarPoller._signature``).
+_SIGNATURE_COLUMNS = ("time", "open", "high", "low", "close", "volume")
+
+
+def _stable_scalar(value):
+    """Render one cell so equal values compare equal across pandas versions.
+
+    ``repr`` of a numpy scalar is ``"7.62"`` on numpy 1.x but
+    ``"np.float64(7.62)"`` on 2.x. Feeding that straight into the poller's
+    signature would make a bar look "changed" on every poll, and a signature
+    that always differs is just as wrong as one that never does. Floats go
+    through ``float()`` and everything else through ``str()``; no numpy or
+    pandas import is needed, because these objects are only ever touched as
+    already-materialised scalars.
+    """
+    if value is None:
+        return None
+    try:
+        return repr(float(value))
+    except (TypeError, ValueError):
+        return str(value)
+
 
 class _BarPoller(object):
     """Emit a K-line callback when the newest bar changes.
@@ -2063,7 +2090,17 @@ class _BarPoller(object):
 
     @staticmethod
     def _signature(data):
-        """Identify the newest bar cheaply, without assuming a container type."""
+        """Identify the newest bar by content, without assuming a container type.
+
+        This must include the bar's **prices**, not just the row identity. An
+        earlier version keyed a pandas frame by ``(index[-1], len(df))``; with
+        ``count=1`` the length is always 1 and the index of a daily bar is the
+        trading date, so the signature did not change for an entire session.
+        A 1d subscription therefore fired exactly once -- with the snapshot
+        taken at subscribe time -- and never carried the session's progress or
+        its closing values (measured 2026-11-19: push ``close=7.62`` vs a
+        concurrent read ``close=7.64``, with no further push for 8 minutes).
+        """
         try:
             for value in (data or {}).values():
                 if value is None:
@@ -2071,7 +2108,14 @@ class _BarPoller(object):
                 if hasattr(value, "empty"):          # pandas DataFrame
                     if getattr(value, "empty", True):
                         continue
-                    return str(value.index[-1]), int(len(value))
+                    row = value.iloc[-1]
+                    prices = []
+                    for column in _SIGNATURE_COLUMNS:
+                        try:
+                            prices.append(_stable_scalar(row.get(column)))
+                        except (AttributeError, TypeError, ValueError):
+                            prices.append(None)
+                    return (str(value.index[-1]), int(len(value)), tuple(prices))
                 if isinstance(value, (list, tuple)) and value:
                     return repr(value[-1]), len(value)
                 if isinstance(value, dict) and value:
@@ -3456,25 +3500,47 @@ class BigQmtXtData:
 
         seq = self._next_seq()
 
+        # Read two bars, not one: the newest is the bar still forming, so only
+        # the one before it is finished. Emitting the newest (the old behaviour)
+        # handed the caller an in-progress bar and then had to decide whether
+        # each 3 s re-read of it counted as "new data" -- and it always did,
+        # because the RPC and FormulaServer paths return slightly different
+        # snapshots of the same bar (measured 2026-11-19: 59 pushes with 59
+        # distinct OHLCVs in 3 minutes, volume oscillating
+        # 752055 -> 762609 -> 753313).
         def fetch():
             # 盘中形成 bar 必须读 QMT 实时数据——FormulaServer 快照可能滞后数
             # 小时（实测 11:30 后冻结，收盘后还停在午间数据），订阅推送如果走
             # 直连会把"刚完成的 bar"发成数小时前的旧快照（issue #104 实测）。
             return self.get_market_data_ex(
                 stock_list=[stock_code], period=period,
-                start_time=start_time, end_time=end_time, count=count or 1,
+                start_time=start_time, end_time=end_time, count=2,
                 use_formula=False)
 
+        def finished_bars(data):
+            """Drop the still-forming newest bar from a poll result."""
+            trimmed = {}
+            for code, frame in (data or {}).items():
+                if frame is None:
+                    continue
+                if hasattr(frame, "iloc"):           # pandas DataFrame
+                    trimmed[code] = frame.iloc[:-1] if len(frame) > 1 else frame.iloc[:0]
+                elif isinstance(frame, (list, tuple)):
+                    trimmed[code] = frame[:-1] if len(frame) > 1 else []
+                else:
+                    trimmed[code] = frame
+            return trimmed
+
         poller = _BarPoller(
-            fetch, callback, self._bar_poll_interval_seconds(),
+            lambda: finished_bars(fetch()), callback, self._bar_poll_interval_seconds(),
             on_error=lambda exc: log.debug(
                 "subscribe_quote poll failed code=%s period=%s: %s",
                 stock_code, period, exc),
             on_no_data=lambda: log.warning(
-                "subscribe_quote: no %s bars for %s -- the subscription is live "
-                "but stays silent until this terminal has data for that period. "
-                "Check the period is downloaded (get_market_data_ex returns an "
-                "empty frame for it).", period, stock_code))
+                "subscribe_quote: no finished %s bars for %s -- the subscription is "
+                "live but stays silent until this terminal has a completed bar for "
+                "that period. Check the period is downloaded (get_market_data_ex "
+                "returns an empty frame for it).", period, stock_code))
         with self._bar_poller_lock:
             self._bar_pollers[seq] = poller
         poller.start()
