@@ -53,6 +53,15 @@ Homepage = "https://github.com/litaolemo/xtquant_big_convert"
 Repository = "https://github.com/litaolemo/xtquant_big_convert.git"
 Issues = "https://github.com/litaolemo/xtquant_big_convert/issues"
 
+# pyright/basedpyright/Pylance 的解释器声明：venv 就在仓库根目录的 .venv。
+# 全用相对路径，不写死任何绝对路径。若 <venvPath>/<venv>/lib 下解析不出 site-packages
+# （例如 .venv 是 Windows 布局，或 Linux 侧还没跑过 `uv sync`），语言服务器会退回
+# 系统解释器，把 /usr/lib/python3.* 之类的整棵目录树注册成 file watcher，
+# 在 Eglot 里会撞上 eglot-max-file-watches 上限并让服务端退出。
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 py-modules = [
