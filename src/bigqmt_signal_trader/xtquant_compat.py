@@ -1037,6 +1037,68 @@ def _formula_stale_active():
     return time.time() < _formula_stale_until.get("ts", 0.0)
 
 
+def _last_bar_start_seconds(frame):
+    """Epoch seconds at which the frame's last bar *started*, or None.
+
+    Two shapes reach here and neither can be assumed:
+
+    * a normalized frame carries a ``time`` column of epoch milliseconds (the
+      MiniQMT shape), with a positional index;
+    * a stime-indexed frame carries the Beijing wall-clock label in its index.
+
+    Reading only the index silently skipped every normalized frame -- which is
+    the shape every live read actually returns.
+    """
+    try:
+        if "time" in getattr(frame, "columns", ()):
+            values = frame["time"]
+            if len(values):
+                return float(values.iloc[-1] if hasattr(values, "iloc") else values[-1]) / 1000.0
+    except Exception:
+        pass
+    labels = _frame_bar_labels(frame)
+    if labels:
+        # ``_frame_bar_labels`` normalizes through ``_qmt_stime_index``, which
+        # truncates a minute label (YYYYMMDDHHMM) to its date. Read the raw
+        # index instead so an intraday bar keeps its minute.
+        raw = labels[-1]
+        try:
+            if getattr(frame, "index", None) is not None and len(frame.index):
+                candidate = _digits_only(frame.index[-1])
+                if len(candidate) > len(_digits_only(raw)):
+                    raw = frame.index[-1]
+        except Exception:
+            pass
+        return _label_to_epoch_seconds(raw)
+    return None
+
+
+def _label_to_epoch_seconds(label):
+    """Epoch seconds for a QMT bar label, or None when it is not a timestamp.
+
+    Labels are Beijing wall-clock digits (``YYYYMMDD`` or ``YYYYMMDDHHMMSS``),
+    so they must be anchored to +08:00 rather than the host's zone -- the same
+    rule ``_qmt_datetime_to_epoch_ms`` follows for the time column.
+    """
+    digits = _digits_only(label)
+    if len(digits) >= 14:
+        pattern, width = "%Y%m%d%H%M%S", 14
+    elif len(digits) >= 12:
+        # Intraday bar labels are minute precision (YYYYMMDDHHMM); the zone is
+        # applied below, so a minute cannot be lost to a date-only parse.
+        pattern, width = "%Y%m%d%H%M", 12
+    elif len(digits) >= 8:
+        pattern, width = "%Y%m%d", 8
+    else:
+        return None
+    try:
+        parsed = _dt.datetime.strptime(digits[:width], pattern)
+    except ValueError:
+        return None
+    china_tz = _dt.timezone(_dt.timedelta(hours=8))
+    return parsed.replace(tzinfo=china_tz).timestamp()
+
+
 def _qmt_stime_index(value):
     digits = _digits_only(value)
     if len(digits) >= 14:
@@ -1985,6 +2047,24 @@ RESYNTH_PERIOD_STARTS = {
 _RESYNTH_NOTICE = {"shown": False}
 _DAILY_RESCUE_NOTICE = {"shown": False}
 
+#: Intraday periods whose bar length is a fixed number of seconds. A bar whose
+#: start plus this many seconds still lies in the future has not closed yet.
+#: Daily and longer periods follow trading-day semantics instead (see
+#: ``_drop_unclosed_bars``), and tick frames carry no bar boundary at all.
+PERIOD_BAR_SECONDS = {
+    "1m": 60,
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
+    "1h": 3600,
+    "2h": 7200,
+    "4h": 14400,
+}
+
+#: A-share daily session close. A daily bar labelled today is only final after
+#: this wall-clock time.
+DAILY_CLOSE_TIME = _dt.time(15, 0)
+
 
 def _in_trading_session(now):
     """Weekday inside the day session (auction open through the settle
@@ -2628,7 +2708,8 @@ class BigQmtXtData:
                 # A filled row carries no real preClose and would be picked as
                 # a period's "first trading day" if it were returned (#167).
                 fill_data=False, timeout_seconds=timeout_seconds,
-                use_formula=use_formula, backfill_pre_close=False, subscribe=subscribe,
+                use_formula=use_formula, backfill_pre_close=False,
+                drop_unclosed=False, subscribe=subscribe,
             )
         except Exception as exc:
             # Degrade to the terminal's answer. The bars themselves are good;
@@ -2773,7 +2854,8 @@ class BigQmtXtData:
                 start_time=first, end_time=today, count=-1,
                 dividend_type=dividend_type, fill_data=False,
                 timeout_seconds=timeout_seconds, use_formula=use_formula,
-                backfill_pre_close=False, resynth_ongoing_multiday=False, subscribe=subscribe,
+                backfill_pre_close=False, resynth_ongoing_multiday=False,
+                drop_unclosed=False, subscribe=subscribe,
             )
         except Exception as exc:
             # The terminal's answer was good enough to serve; taking the whole
@@ -2847,6 +2929,7 @@ class BigQmtXtData:
                 dividend_type=dividend_type, fill_data=False,
                 timeout_seconds=timeout_seconds, use_formula=False,
                 backfill_pre_close=False, resynth_ongoing_multiday=False,
+                drop_unclosed=False,
             )
         except Exception as exc:
             # The local answer was good enough to serve; taking the whole
@@ -2975,6 +3058,73 @@ class BigQmtXtData:
         return wrote
 
     @staticmethod
+    def _drop_unclosed_bars(data, period, now=None):
+        """Remove the last bar of each frame while it is still forming.
+
+        QMT answers a bar read with the session's in-progress bar appended: a
+        daily read at 10:30 returns today's partial OHLCV, a ``1m`` read
+        returns the minute that has not finished. Callers that build signals
+        from finished bars (upstream strategy warm-up) were silently fed those
+        partial values, and nothing later corrected them: the subscription
+        side only delivers bars once they close.
+
+        Two rules, because a bar's length is fixed only for intraday periods:
+
+        * intraday (``1m``/``5m``/...) -- the bar is final once
+          ``start + PERIOD_BAR_SECONDS`` has passed;
+        * daily -- a bar labelled today is final only after
+          ``DAILY_CLOSE_TIME``. Weekends and holidays have no today-bar at all,
+          so a Friday read on Saturday returns Friday finalized.
+
+        Weekly and longer periods are left alone: ``_resynth_ongoing_multiday_bars``
+        owns their ongoing bar and would otherwise be fighting this filter.
+        Tick frames carry no bar boundary.
+
+        Degrades to the terminal's answer: a frame whose labels cannot be read
+        is passed through untouched rather than guessed at.
+        """
+        if not isinstance(data, dict):
+            return data
+        period = str(period or "").lower()
+        if period in RESYNTH_ONGOING_PERIODS:
+            return data
+        bar_seconds = PERIOD_BAR_SECONDS.get(period)
+        if bar_seconds is None and period != "1d":
+            return data
+
+        moment = now if now is not None else _now()
+        today = moment.strftime("%Y%m%d")
+        now_seconds = moment.timestamp()
+        dropped = 0
+        out = {}
+        for code, frame in data.items():
+            start = _last_bar_start_seconds(frame)
+            if start is None:
+                out[code] = frame
+                continue
+            if period == "1d":
+                # A daily bar's start is the session date; it stays open until
+                # the close on that same day.
+                label = _dt.datetime.fromtimestamp(
+                    start, _dt.timezone(_dt.timedelta(hours=8))).strftime("%Y%m%d")
+                unclosed = label == today and moment.time() < DAILY_CLOSE_TIME
+            else:
+                unclosed = start + bar_seconds > now_seconds
+            if not unclosed:
+                out[code] = frame
+                continue
+            try:
+                trimmed = frame.iloc[:-1] if hasattr(frame, "iloc") else frame[:-1]
+            except Exception:
+                out[code] = frame
+                continue
+            out[code] = trimmed
+            dropped += 1
+        if dropped:
+            log.debug("dropped %d unclosed %s bar(s) from the read", dropped, period)
+        return out
+
+    @staticmethod
     def _notice_resynth_ongoing(period, count, appended=0):
         """Say once that ongoing bars are rebuilt here, not answered by QMT."""
         if _RESYNTH_NOTICE["shown"]:
@@ -3023,6 +3173,7 @@ class BigQmtXtData:
         use_formula=True,
         backfill_pre_close=True,
         resynth_ongoing_multiday=True,
+        drop_unclosed=True,
         heal=True,
         subscribe=None,
     ):
@@ -3125,6 +3276,12 @@ class BigQmtXtData:
                 dividend_type=dividend_type, timeout_seconds=timeout_seconds,
                 use_formula=use_formula, subscribe=subscribe,
             )
+
+        if drop_unclosed:
+            # After the rebuild, before caching: the cache must hold the same
+            # bars a caller sees, or the next read would resurrect the partial
+            # one from disk.
+            data = self._drop_unclosed_bars(data, period=period)
 
         cache = self._local_cache()
         if cache is not None and isinstance(data, dict):
